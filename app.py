@@ -42,15 +42,19 @@ def load_resources():
     pipeline = joblib.load(model_path)
     label_encoder = joblib.load(encoder_path)
     
-    # Load spaCy model provisioned by setup.sh or requirements.txt
+    # Clean loader without scoping conflicts
     try:
-        nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        import spacy.cli
-        spacy.cli.download("en_core_web_sm")
-        nlp = spacy.load("en_core_web_sm")
+        import en_core_web_sm
+        nlp_model = en_core_web_sm.load()
+    except Exception:
+        try:
+            nlp_model = spacy.load("en_core_web_sm")
+        except OSError:
+            from spacy.cli import download
+            download("en_core_web_sm")
+            nlp_model = spacy.load("en_core_web_sm")
         
-    return pipeline, label_encoder, nlp
+    return pipeline, label_encoder, nlp_model
 
 pipeline, label_encoder, nlp = load_resources()
 
@@ -297,7 +301,7 @@ if app_mode == "Requirement Inspector":
                 st.caption("Tip: Add a Groq API key in the sidebar for real-time explanations, missing context points, and full rewrites.")
 
 # -------------------------------------------------------------
-# MODE 2: BATCH DOCUMENT ANALYSIS (OPTIMIZED WITH PROGRESS & BATCH SPACY)
+# MODE 2: BATCH DOCUMENT ANALYSIS
 # -------------------------------------------------------------
 elif app_mode == "Batch Document Analysis":
     st.title("Batch Document Analysis")
