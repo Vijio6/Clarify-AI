@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import sys
+import subprocess
 import os
 import re
 import spacy
@@ -42,12 +44,17 @@ def load_resources():
     pipeline = joblib.load(model_path)
     label_encoder = joblib.load(encoder_path)
     
-    # Load spaCy model pre-installed via requirements.txt wheel
+    # Robust cloud loader for spaCy model
     try:
         nlp = spacy.load("en_core_web_sm")
-    except Exception:
-        import en_core_web_sm
-        nlp = en_core_web_sm.load()
+    except OSError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"])
+        import site
+        from importlib import reload
+        reload(site)
+        nlp = spacy.load("en_core_web_sm")
+        
+    return pipeline, label_encoder, nlp
         
     return pipeline, label_encoder, nlp
 
