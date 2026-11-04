@@ -42,12 +42,12 @@ def load_resources():
     pipeline = joblib.load(model_path)
     label_encoder = joblib.load(encoder_path)
     
+    # Load spaCy model pre-installed via requirements.txt wheel
     try:
         nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        from spacy.cli import download
-        download("en_core_web_sm")
-        nlp = spacy.load("en_core_web_sm")
+    except Exception:
+        import en_core_web_sm
+        nlp = en_core_web_sm.load()
         
     return pipeline, label_encoder, nlp
 
@@ -102,7 +102,7 @@ def extract_single_features(text: str):
     return feat_df, cleaned, detected_weak, is_passive, has_actor
 
 def get_groq_stream(api_key: str, text: str, category: str, weak_words: list):
-    """Dynamically finds available text models on the user's account and streams output."""
+    """Dynamically finds available text models on the account and streams output without cutoff."""
     if not api_key or not GROQ_AVAILABLE:
         return None
     try:
@@ -123,17 +123,15 @@ List bullet points of exact missing criteria (e.g., maximum latency in ms, error
 ### 3. IEEE-830 Compliant Rewrite
 Provide a complete, verifiable rewrite starting with 'The system shall...'."""
 
-        # 1. Fetch exact models currently available on this account
+        # Fetch active models available on this API key
         try:
             models_data = client.models.list().data
             active_ids = [m.id for m in models_data]
         except Exception:
             active_ids = []
 
-        # 2. Filter out audio/whisper/guard models
         chat_models = [m for m in active_ids if not any(x in m.lower() for x in ['whisper', 'guard', 'safeguard'])]
 
-        # Preferred models ordered by reasoning quality
         preferred_order = [
             "llama3-70b-8192",
             "llama3-8b-8192",
@@ -145,14 +143,11 @@ Provide a complete, verifiable rewrite starting with 'The system shall...'."""
             "llama-3.2-1b-preview"
         ]
 
-        # Prioritize available models
         sorted_candidates = [m for m in preferred_order if m in chat_models]
-        # Append any remaining active chat models
         for m in chat_models:
             if m not in sorted_candidates:
                 sorted_candidates.append(m)
 
-        # Fallback list if model listing is restricted
         if not sorted_candidates:
             sorted_candidates = ["llama3-8b-8192", "llama3-70b-8192", "mixtral-8x7b-32768"]
 
@@ -189,14 +184,24 @@ app_mode = st.sidebar.radio(
 
 st.sidebar.divider()
 st.sidebar.subheader("Groq API Key")
+
+# Seamlessly fallback to st.secrets if configured on Streamlit Cloud
+default_api_key = ""
+try:
+    if "GROQ_API_KEY" in st.secrets:
+        default_api_key = st.secrets["GROQ_API_KEY"]
+except Exception:
+    pass
+
 groq_api_key = st.sidebar.text_input(
     "Enter Groq API Key (Optional)", 
+    value=default_api_key,
     type="password", 
     help="Enables dynamic IEEE-830 rewrites, ambiguity explanations, and missing context prompts."
 )
 
 if pipeline is None:
-    st.error("Model files not found in `model_results/`. Please run Step 4 first.")
+    st.error("Model files not found in `model_results/`. Please verify `model_results/` contains `best_model.joblib` and `label_encoder.joblib`.")
     st.stop()
 
 # -------------------------------------------------------------
@@ -291,7 +296,7 @@ if app_mode == "Requirement Inspector":
                 st.caption("Tip: Add a Groq API key in the sidebar for real-time explanations, missing context points, and full rewrites.")
 
 # -------------------------------------------------------------
-# MODE 2: BATCH DOCUMENT ANALYSIS
+# MODE 2: BATCH DOCUMENT ANALYSIS (OPTIMIZED WITH PROGRESS & BATCH SPACY)
 # -------------------------------------------------------------
 elif app_mode == "Batch Document Analysis":
     st.title("Batch Document Analysis")
@@ -308,30 +313,84 @@ elif app_mode == "Batch Document Analysis":
             content = uploaded_file.read().decode("utf-8")
             req_list = [line.strip() for line in content.split("\n") if line.strip()]
 
-        st.write(f"Loaded **{len(req_list)}** requirement statements.")
+        total_count = len(req_list)
+        st.write(f"Loaded **{total_count}** requirement statements.")
+
+        col_opt1, col_opt2 = st.columns([1, 2])
+        with col_opt1:
+            run_sample = st.checkbox("Quick Audit (first N items)", value=(total_count > 500))
+        with col_opt2:
+            sample_size = st.number_input("Sample size:", min_value=10, max_value=total_count, value=min(200, total_count)) if run_sample else total_count
+
+        active_reqs = req_list[:sample_size] if run_sample else req_list
 
         if st.button("Run Batch Ambiguity Audit", type="primary"):
-            records = []
-            for req in req_list:
-                feat_df, cleaned, weak_words, is_passive, has_actor = extract_single_features(req)
-                pred_idx = pipeline.predict(feat_df)[0]
-                pred_label = label_encoder.inverse_transform([pred_idx])[0]
-                probas = pipeline.predict_proba(feat_df)[0]
-                
-                clear_idx = np.where(label_encoder.classes_ == "Clear")[0]
-                p_clear = probas[clear_idx[0]] if len(clear_idx) > 0 else 0.0
-                raw_score = (1.0 - p_clear) * 100
-                ambiguity_score = int(min(100, max(5, raw_score + (len(weak_words) * 10) + (10 if is_passive else 0))))
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            status_text.text("Cleaning and tokenizing requirements in batches...")
 
-                records.append({
-                    "Requirement": req,
-                    "Category": pred_label,
-                    "Ambiguity Score": ambiguity_score,
-                    "Weak Words": "; ".join(weak_words) if weak_words else "None",
-                    "Passive Voice": "Yes" if is_passive else "No"
+            cleaned_texts = [clean_artifacts(r) for r in active_reqs]
+
+            # Vectorized spaCy processing
+            nlp_docs = list(nlp.pipe(cleaned_texts, batch_size=256, n_process=1))
+
+            records = []
+            feature_rows = []
+            total_items = len(active_reqs)
+
+            for idx, (raw_req, cleaned, doc) in enumerate(zip(active_reqs, cleaned_texts, nlp_docs)):
+                tokens = [t for t in doc if not t.is_punct and not t.is_space]
+                detected_weak = find_weak_words(raw_req, doc)
+                is_passive = any(t.dep_ in ('auxpass', 'nsubjpass') for t in doc)
+                has_modal = any(t.lemma_.lower() in MODAL_WORDS for t in doc)
+                has_actor = any(t.dep_ == 'nsubj' for t in doc)
+                conj_count = sum(1 for t in tokens if t.pos_ == 'CCONJ' or t.text.lower() in ('and', 'or'))
+
+                feature_rows.append({
+                    'cleaned_text': cleaned,
+                    'vague_word_count': len(detected_weak),
+                    'has_passive': 1 if is_passive else 0,
+                    'has_actor': 1 if has_actor else 0,
+                    'has_modal': 1 if has_modal else 0,
+                    'word_count': len(tokens),
+                    'conjunction_count': conj_count
                 })
 
-            res_df = pd.DataFrame(records)
+                records.append({
+                    "Requirement": raw_req,
+                    "Weak Words": "; ".join(detected_weak) if detected_weak else "None",
+                    "Passive Voice": "Yes" if is_passive else "No",
+                    "_weak_count": len(detected_weak),
+                    "_is_passive": is_passive
+                })
+
+                if (idx + 1) % max(1, total_items // 20) == 0:
+                    progress_bar.progress((idx + 1) / total_items)
+                    status_text.text(f"Processed {idx + 1}/{total_items} requirements...")
+
+            status_text.text("Running model predictions...")
+            batch_feat_df = pd.DataFrame(feature_rows)
+            pred_indices = pipeline.predict(batch_feat_df)
+            pred_labels = label_encoder.inverse_transform(pred_indices)
+            pred_probas = pipeline.predict_proba(batch_feat_df)
+
+            clear_idx = np.where(label_encoder.classes_ == "Clear")[0]
+            clear_col = clear_idx[0] if len(clear_idx) > 0 else 0
+
+            for i in range(total_items):
+                p_clear = pred_probas[i][clear_col]
+                raw_score = (1.0 - p_clear) * 100
+                ambiguity_score = int(min(100, max(5, raw_score + (records[i]["_weak_count"] * 10) + (10 if records[i]["_is_passive"] else 0))))
+                records[i]["Category"] = pred_labels[i]
+                records[i]["Ambiguity Score"] = ambiguity_score
+                del records[i]["_weak_count"]
+                del records[i]["_is_passive"]
+
+            progress_bar.progress(1.0)
+            status_text.empty()
+            progress_bar.empty()
+
+            res_df = pd.DataFrame(records)[["Requirement", "Category", "Ambiguity Score", "Weak Words", "Passive Voice"]]
 
             kpi1, kpi2, kpi3, kpi4 = st.columns(4)
             kpi1.metric("Total Analyzed", len(res_df))
@@ -345,7 +404,7 @@ elif app_mode == "Batch Document Analysis":
             st.download_button(
                 label="Download Analysis Report (CSV)",
                 data=csv_download,
-                file_name="clarify_ai_analysis_report.csv",
+                file_name="clarify_ai_batch_analysis.csv",
                 mime="text/csv"
             )
 
