@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import sys
-import subprocess
 import os
 import re
+import sys
+import subprocess
 import spacy
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -44,17 +44,18 @@ def load_resources():
     pipeline = joblib.load(model_path)
     label_encoder = joblib.load(encoder_path)
     
-    # Robust cloud loader for spaCy model
+    # Robust cloud loader for spaCy model with user-level fallback
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"])
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--user",
+            "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+        ])
         import site
         from importlib import reload
         reload(site)
         nlp = spacy.load("en_core_web_sm")
-        
-    return pipeline, label_encoder, nlp
         
     return pipeline, label_encoder, nlp
 
@@ -192,7 +193,7 @@ app_mode = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.subheader("Groq API Key")
 
-# Seamlessly fallback to st.secrets if configured on Streamlit Cloud
+# Check Streamlit Cloud secrets first, fallback to user input
 default_api_key = ""
 try:
     if "GROQ_API_KEY" in st.secrets:
